@@ -21,94 +21,159 @@ parameters:
 pool:
   name: Apagents
 stages:
-- stage: BuildStage
+- stage: PreCommit
+  displayName: PreCommit/Static Analysis Stage
   jobs:
   - job: Tflintscanning
     displayName: Tflint Scanning
     steps:
     - task: PowerShell@2
+      displayName: Tflint Scanning
       inputs:
         targetType: 'inline'
         script: |
-          $url = "https://github.com/terraform-linters/tflint/releases/latest/download/tflint_windows_amd64.zip"
-          $out = "$(Agent.TempDirectory)\tflint.zip"
-          Invoke-WebRequest -Uri $url -OutFile $out
+          $tfsecVersion = "v1.28.5"
+          $url = "https://github.com/aquasecurity/tfsec/releases/download/$tfsecVersion/tfsec-windows-amd64.exe"
+          $tfsecPath = "$(Agent.TempDirectory)\tfsec.exe"
+          Invoke-WebRequest -Uri $url -OutFile $tfsecPath
+          & $tfsecPath "$(System.DefaultWorkingDirectory)\environments\${{ parameters.env }}"
           
-          
+
+  - job: Tfsec
+    displayName: Tfsec Scan
+    steps:
     - task: PowerShell@2
+      displayName: Tfsec Scanning
       inputs:
         targetType: 'inline'
         script: |
-          pip install checkov
-          checkov --version
-          checkov -d "$(System.DefaultWorkingDirectory)/environments/${{ parameters.env }}"
+          $tfsecVersion = "v1.28.5"
+          $url = "https://github.com/aquasecurity/tfsec/releases/download/$tfsecVersion/tfsec-windows-amd64.exe"
+          $tfsecPath = "$(Agent.TempDirectory)\tfsec.exe"
+          Write-Host "Downloading tfsec..."
+          Invoke-WebRequest -Uri $url -OutFile $tfsecPath
+          Write-Host "Running tfsec scan..."
+          & $tfsecPath "$(System.DefaultWorkingDirectory)\environments\${{ parameters.env }}"
 
-    
-
-  - job: TerraformInitialization
-    displayName: Terraform Initialization
+  - job: TerraformValidate
+    displayName: Terraform Validate
     steps:
-    - task: TerraformInstaller@1
-      displayName: Terraform Install
-      inputs:
-        terraformVersion: 'latest'
     - task: TerraformTask@5
-      displayName: Terraform Init
+      displayName: Terraform Vaidate
       inputs:
         provider: 'azurerm'
-        command: 'init'
-        workingDirectory: '$(System.DefaultWorkingDirectory)/environments/${{ parameters.env }}'
-        backendServiceArm: 'Appserviceconn'
-        backendAzureRmResourceGroupName: $(rg_name)
-        backendAzureRmStorageAccountName: $(stg_name)
-        backendAzureRmContainerName: $(container_name)
-        backendAzureRmKey: '${{ parameters.env }}apstate.tf'
+        command: 'validate'
+
+  - job: Terraformfmt
+    displayName: Terraform fmt
+    steps:
     - task: TerraformTask@5
-      displayName: Terraform Plan
+      displayName: Terraform fmt
       inputs:
         provider: 'azurerm'
-        command: 'plan'
-        workingDirectory: '$(System.DefaultWorkingDirectory)/environments/${{ parameters.env }}'
-        environmentServiceNameAzureRM: 'Appserviceconn'
-- stage: DeployStage
-  dependsOn:
-  - BuildStage
+        command: 'custom'
+        outputTo: 'console'
+        customCommand: 'fmt'
+        environmentServiceNameAzureRM: 'Terraformsecretserviceconnection'
+
+- stage: InfraCost
+  displayName: Cost & Impact Assessment Stage
   jobs:
-  - job: ManualValidation
-    displayName: Manual Validation
-    pool:
-      name: server
-    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
-    steps:
-    - task: ManualValidation@1
-      inputs:
-        notifyUsers: 'aparnaajaykumar06@gmail.com'
-        onTimeout: 'resume'
-  - job: TerraformApply
-    dependsOn:
-    - ManualValidation
-    pool:
-      name: Apagents
-    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
-    steps:
-    - task: TerraformInstaller@1
-      inputs:
-        terraformVersion: 'latest'
-    - task: TerraformTask@5
-      displayName: Terraform Init
-      inputs:
-        provider: 'azurerm'
-        command: 'init'
-        workingDirectory: '$(System.DefaultWorkingDirectory)/environments/${{ parameters.env }}'
-        backendServiceArm: 'Appserviceconn'
-        backendAzureRmResourceGroupName: 'Apbackend'
-        backendAzureRmStorageAccountName: 'apstg0001009000'
-        backendAzureRmContainerName: 'backend'
-        backendAzureRmKey: '${{ parameters.env }}apstate.tf'
-    - task: TerraformTask@5
-      displayName: Terraform Apply
-      inputs:
-        provider: 'azurerm'
-        command: 'apply'
-        workingDirectory: '$(System.DefaultWorkingDirectory)/environments/${{ parameters.env }}'
-        environmentServiceNameAzureRM: 'Appserviceconn'
+    - job: InfraCost
+      steps:
+      - task: TerraformTask@5
+        displayName: Terraform Init
+        inputs:
+          provider: 'azurerm'
+          command: 'init'
+          workingDirectory: '$(System.DefaultWorkingDirectory)/environments/${{ parameters.env }}'
+          backendServiceArm: 'Terraformsecretserviceconnection'
+          backendAzureRmResourceGroupName: 'Appsrg'
+          backendAzureRmStorageAccountName: 'backendstg0001'
+          backendAzureRmContainerName: 'backend'
+          backendAzureRmKey: '${{ parameters.env }}state.tf'
+
+      - task: TerraformTask@5
+        displayName: Terraform Plan
+        inputs:
+          provider: 'azurerm'
+          command: 'plan'
+          workingDirectory: '$(System.DefaultWorkingDirectory)/environments/${{ parameters.env }}'
+          commandOptions: '-out=tfplan'
+          environmentServiceNameAzureRM: 'Terraformsecretserviceconnection'
+      
+      - task: PowerShell@2
+        displayName: InfraCost
+        inputs:
+          targetType: 'inline'
+          script: |
+            cd $(System.DefaultWorkingDirectory)/environments/${{ parameters.env }}
+            pwd
+            infracost breakdown --path tfplan --format table
+
+- stage: PlanStage
+  displayName: Plan & Review Stage
+  jobs:
+    - job: Planning
+      displayName: Planning
+      steps:
+      - task: TerraformTask@5
+        displayName: Terraform init
+        inputs:
+          provider: 'azurerm'
+          command: 'init'
+          workingDirectory: '$(System.DefaultWorkingDirectory)/environments/${{ parameters.env }}'
+          backendServiceArm: 'Terraformsecretserviceconnection'
+          backendAzureRmResourceGroupName: 'Appsrg'
+          backendAzureRmStorageAccountName: 'backendstg0001'
+          backendAzureRmContainerName: 'backend'
+          backendAzureRmKey: '${{ parameters.env }}state.tf'
+
+      - task: TerraformTask@5
+        displayName: Terraform Plan
+        inputs:
+          provider: 'azurerm'
+          command: 'plan'
+          workingDirectory: '$(System.DefaultWorkingDirectory)/environments/${{ parameters.env }}'
+          environmentServiceNameAzureRM: 'Terraformsecretserviceconnection'
+
+- stage: ApprovalStage
+  displayName: Approval & Governance Stage
+  dependsOn:
+  - PlanStage
+  jobs:
+    - job: ManualValidation
+      displayName: Manual Validation
+      pool: server
+      steps:
+      - task: ManualValidation@1
+        displayName: Manual Validation
+        inputs:
+          notifyUsers: 'aparnaajaykumar06@gmail.com'
+
+- stage: ApplyStage
+  displayName: Deploy/Apply Stage
+  dependsOn:
+  - ApprovalStage
+  jobs:
+    - job: ApplyJob
+      steps:
+      - task: TerraformTask@5
+        displayName: Terraform Init
+        inputs:
+          provider: 'azurerm'
+          command: 'init'
+          workingDirectory: '$(System.DefaultWorkingDirectory)/environments/${{ parameters.env }}'
+          backendServiceArm: 'Terraformsecretserviceconnection'
+          backendAzureRmResourceGroupName: 'Appsrg'
+          backendAzureRmStorageAccountName: 'backendstg0001'
+          backendAzureRmContainerName: 'backend'
+          backendAzureRmKey: '${{ parameters.env }}state.tf'
+
+      - task: TerraformTask@5
+        displayName: Terraform Apply
+        inputs:
+          provider: 'azurerm'
+          command: 'apply'
+          workingDirectory: '$(System.DefaultWorkingDirectory)/environments/${{ parameters.env }}'
+          environmentServiceNameAzureRM: 'Terraformsecretserviceconnection'
